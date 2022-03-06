@@ -11,6 +11,7 @@ use serde::Serialize;
 use std::{cell::RefCell, collections::HashMap};
 use openssl::sign::Verifier;
 use openssl::x509::X509;
+use crate::error::AlipayError;
 
 fn get_hour_min_sec(timestamp: u64) -> (i32, i32, i32) {
     let hour = ((timestamp % (24 * 3600)) / 3600 + 8) % 24;
@@ -167,12 +168,19 @@ impl Client {
         }
         temp.pop();
 
+        params.push(
+            ("sign".to_owned(),
+            self.sign_with_private_key(temp.as_bytes())?
+        ));
+        Ok(serde_urlencoded::to_string(params)?)
+    }
+    ///使用私钥签名
+    pub fn sign_with_private_key(&self,bytes:&[u8])->AlipayResult<String>{
         let private_key = self.get_private_key()?;
         let mut signer = Signer::new(MessageDigest::sha256(), &private_key)?;
-        signer.update(temp.as_bytes())?;
+        signer.update(bytes)?;
         let sign = base64::encode_block(signer.sign_to_vec()?.as_ref());
-        params.push(("sign".to_owned(), sign));
-        Ok(serde_urlencoded::to_string(params)?)
+        Ok(sign)
     }
     // 设置请求参数，如果参数存在，更新参数，不存在则插入参数
     fn set_request_params<S: Into<String>>(&mut self, key: S, val: String) {
@@ -377,18 +385,9 @@ impl Client {
 
         Ok(PKey::from_rsa(rsa)?)
     }
-}
 
-impl SignChecker {
-    pub fn new(alipay_public_bytes:&[u8])->SignChecker{
-        let ssl = X509::from_pem(alipay_public_bytes).unwrap();
-        SignChecker{
-            alipay_public_key:ssl.public_key().unwrap()
-        }
-    }
-
-    ///验签
-    pub fn check_sign(self,params:&HashMap<String,String>)->Result<(),String>{
+    ///map字典排序组合
+    pub fn get_sign_content(params:&HashMap<String,String>)->String{
         //字典排序
         let mut keys=Vec::from_iter(params.keys());
         keys.sort();
@@ -403,20 +402,34 @@ impl SignChecker {
             }
             sb.append(format!("{}={}",key,params[key]))
         }
+        sb.string().unwrap()
+    }
+}
+
+impl SignChecker {
+    pub fn new(alipay_public_bytes:&[u8])->SignChecker{
+        let ssl = X509::from_pem(alipay_public_bytes).unwrap();
+        SignChecker{
+            alipay_public_key:ssl.public_key().unwrap()
+        }
+    }
+
+    ///验签
+    pub fn check_sign(self,params:&HashMap<String,String>)->AlipayResult<()>{
+        //验签字符串
+        let str=Client::get_sign_content(params);
         //获取sign
         let sign_str=if let Some(sign) = params.get("sign"){
             sign
         }else {
-            return Err("no sign field find".to_owned());
+            return Err(AlipayError::new("no sign field find"));
         };
         //base64解码
         let sign = if let Ok(sign) = base64::decode_block(sign_str){
             sign
         }else{
-            return Err("sign base64_decode fail".to_owned())
+            return Err(AlipayError::new("sign base64_decode fail"))
         };
-        //验签
-        let str=sb.string().unwrap();
         let mut verifier = Verifier::new(MessageDigest::sha256(), &self.alipay_public_key).unwrap();
         verifier.update(str.as_bytes()).unwrap();
         verifier.verify(sign.as_slice()).unwrap();
